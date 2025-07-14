@@ -1,0 +1,118 @@
+---
+- name: Azure Infra Demo
+  hosts: localhost
+  connection: local
+  vars:
+    subscription_id: ""
+    resource_group: lab-rg
+    location: centralus
+    vnet_name: lab-vnet
+    vnet_address_prefixes: ["10.0.0.0/16"]
+    app_subnet: app-subnet
+    app_subnet_address_prefix: "10.0.1.0/24"
+    db_subnet: db-subnet
+    db_subnet_address_prefix: "10.0.2.0/24"
+    db_server_name: lab-sqlserver
+    db_admin_username: "admin"
+    db_admin_password: "adminPassword123$"
+    db_name: testdb
+  tasks:
+    - name: Create Resource Group
+      azure_rm_resourcegroup:
+        name: "{{ resource_group }}"
+        location: "{{ location }}"
+
+    - name: Create VNet
+      azure_rm_virtualnetwork:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vnet_name }}"
+        address_prefixes: "{{ vnet_address_prefixes }}"
+
+    - name: Create App Subnet
+      azure_rm_subnet:
+        resource_group: "{{ resource_group }}"
+        name: "{{ app_subnet }}"
+        address_prefix: "{{ app_subnet_address_prefix }}"
+        virtual_network: "{{ vnet_name }}"
+        private_link_service_network_policies: "Disabled"
+
+    - name: Create DB Subnet
+      azure_rm_subnet:
+        resource_group: "{{ resource_group }}"
+        name: "{{ db_subnet }}"
+        address_prefix: "{{ db_subnet_address_prefix }}"
+        virtual_network: "{{ vnet_name }}"
+        private_link_service_network_policies: "Disabled"
+
+    - name: Create SQL Server
+      azure_rm_sqlserver:
+        resource_group: "{{ resource_group }}"
+        name: "{{ db_server_name }}"
+        version: "12.0"
+        public_network_access: "Disabled"
+        admin_username: "{{ db_admin_username }}"
+        admin_password: "{{ db_admin_password }}"
+
+    - name: Create Private Endpoint for SQL Server
+      azure_rm_privateendpoint:
+        resource_group: "{{ resource_group }}"
+        name: "{{ db_server_name}}-pe"
+        subnet: "{{ db_subnet }}"
+        virtual_network: "{{ vnet_name }}"
+        private_link_service_connections:
+          - name: "lab-sqlserver-connection"
+            private_link_service_id: "/subscriptions/{{ subscription_id }}/resourceGroups/{{ resource_group }}/providers/Microsoft.Sql/servers/{{ db_server_name }}"
+            group_ids:
+              - "sqlServer"
+      register: pe_result
+
+    - name: Get Private IP of SQL Server PE NIC
+      set_fact:
+        sql_private_ip: "{{ pe_result.private_endpoint.network_interfaces[0].ip_configurations[0].private_ip_address }}"
+
+    - name: Create Private DNS Zone
+      azure_rm_privatednszone:
+        resource_group: "{{ resource_group }}"
+        name: "privatelink.database.windows.net"
+
+    - name: Link DNS Zone to VNet
+      azure_rm_privatednszonevirtualnetworklink:
+        resource_group: "{{ resource_group }}"
+        zone_name: "privatelink.database.windows.net"
+        name: "lab-vnet-link"
+        virtual_network: "{{ vnet_name }}"
+        registration_enabled: false
+
+    - name: Create A Record for SQL Server
+      azure_rm_privatednsrecordset:
+        resource_group: "{{ resource_group }}"
+        zone_name: "privatelink.database.windows.net"
+        name: "{{ db_server_name }}"
+        type: "A"
+        records:
+          - ipv4_address: "{{ sql_private_ip }}"
+        ttl: 3600
+
+    - name: Create SQL Database
+      azure_rm_sqldatabase:
+        resource_group: "{{ resource_group }}"
+        server_name: "{{ db_server_name }}"
+        name: "{{ db_name }}"
+        sku:
+          name: Basic
+          tier: Basic
+          capacity: 1
+          size: 1
+
+    - name: Create App Service
+      azure_rm_webapp:
+        resource_group: "{{ resource_group }}"
+        name: "azure-aci-jumpbox"
+        plan:
+          resource_group: "{{ resource_group }}"
+          name: "app-service-plan"
+          is_linux: true
+          sku: B1
+      public_network_access: "Disabled"
+      container_settings:
+        name: "ghcr.io/plycos/azure-aci-jumpbox:latest"
